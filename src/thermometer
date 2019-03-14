@@ -1,0 +1,370 @@
+/*
+ * Project MultipleThermometer
+ * Description: Read DS18B22 Thermometers and report to
+ *              particle.io and/or to a local MQTT broker.
+ * Author: Kirk Carlson
+ * Date: Dec. 20, 2017
+ *
+ * Publishing is controlled with the defines for particlePublishing
+ * and for mqttPublishing. Note that only 4 message per second are
+ * allowed to be published to Particle.
+ */
+
+/*
+ * want to threshold this to reduce reporting while
+ * improving resolution
+ *
+ * light: report abrupt changes
+ * temperature: report temperatures when above a long term average
+ * four temperatures:
+ *   water in
+ *   water out
+ *   flue
+ *   ambient
+
+ * A DHT11 also provides the ambient temperature and humidity.
+
+ * Expect water out to swing the most. Flue may have some fluctions
+ * water in should be fairly constant although affected by ambient
+ * ambient will decrease at night.
+ */
+
+
+//**** LIBRARIES ****
+#include <DS18B20.h>
+#include <MQTT.h>
+#include "Adafruit_DHT.h"
+
+
+//**** DEFINES ****
+
+//#define particlePublishing
+#ifdef particlePublishing
+    #define IF_PARTPUB if(1)
+#else
+    #define IF_PARTPUB if(0)
+#endif
+
+#define mqttPublishing
+#ifdef mqttPublishing
+    #define IF_MQTTPUB if(1)
+#else
+    #define IF_MQTTPUB if(0)
+#endif
+
+#define DEBUG_MESSAGES
+#ifdef DEBUG_MESSAGES
+    #define IF_DEBUG if(1)
+#else
+    #define IF_DEBUG if(0)
+#endif
+
+#define nodeName "Temp1"
+#define DHTTYPE DHT11
+
+
+//**** CONSTANTS ****
+
+const int MAXRETRY = 3;
+const int pinOneWire = D0;
+const int pinPower = A5; // regulated power for lightSensor
+const int pinLightSensor = A0;
+const int pinDHT = D1;
+
+const uint32_t sampleTime = 1000;
+const uint32_t publishTime = 30000;
+const uint32_t freshTempTime = 30000;
+const int numberInTemperatureAverage = 3;
+const float temperatureReportThreshhold = .5; //degrees C
+//const float numberInLightAverage = 2.0;
+const float lightReportThreshhold = 25.0; //units
+const int nSENSORS = 4; //does not work well if set too high
+
+
+//**** VARIABLES AND DATA ****
+
+DS18B20 ds18b20(pinOneWire);
+DHT dht (pinDHT, DHTTYPE);
+
+retained uint8_t sensorAddresses[ nSENSORS][8];
+const int sizeofSensorString = 2*8 + 1; // 8 bytes to hex + null
+retained char sensorString[ nSENSORS][sizeofSensorString];
+float celsius[ nSENSORS];
+uint32_t lastValidTime[ nSENSORS];
+float temperatureAverage[ nSENSORS];
+int lightValue;
+int publishGroup = 0;
+
+
+//**** FUNCTIONS ****
+
+#ifdef mqttPublishing
+void callback(char* topic, byte* payload, unsigned int length);
+
+/*
+ * if want to use IP address,
+ * byte mqttIP[] = { XXX,XXX,XXX,XXX };
+ * MQTT mqttClient(mqttIP, 1883, callback);
+ * want to use domain name,
+ * MQTT mqttClient("www.sample.com", 1883, callback);
+ */
+byte mqttIP [] = { 192,168,4,1 };
+MQTT mqttClient( mqttIP, 1883, callback);
+char *mqttName = "OpenHAB";
+//char *mqttDomain = "bc.local";
+//MQTT mqttClient( mqttDomain, 1883, callback);
+
+
+// recieve message
+void callback(char* topic, byte* payload, unsigned int length) {
+    char p[length + 1];
+    memcpy(p, payload, length);
+    p[length] = NULL;
+
+    delay(1000);
+}
+#endif
+
+
+
+void setup() {
+    dht.begin();
+    ds18b20.resetsearch();                 // initialise for sensor search
+    Serial.begin(9600);
+    publishGroup = 0;
+    for (int i = 0; i < nSENSORS; i++) {   // try to read the sensor addresses
+        celsius[i] = NAN;
+        lastValidTime[i] = 0;
+        ds18b20.search(sensorAddresses[i]); // and if available store
+        sensorToString( sensorString[i], sizeofSensorString, sensorAddresses[i]);
+        float temp = getTemp(sensorAddresses[i]);
+        if (!isnan(temp))
+        {
+            temperatureAverage[i] = temp;
+        }
+
+        IF_DEBUG { Serial.printf("sensor %d: %s\r\n", i, sensorString[i]) ; }
+    }
+
+    // set up the light sensor
+    pinMode( pinLightSensor, INPUT);
+    pinMode( pinPower, OUTPUT);
+    digitalWrite( pinPower, HIGH);
+
+    IF_PARTPUB { Particle.variable("Light", &lightValue, INT); }
+
+    // connect to the MQTT server
+    IF_MQTTPUB
+    {
+        mqttClient.connect(nodeName);
+
+        // publish/subscribe
+        if (mqttClient.isConnected()) {
+            IF_MQTTPUB { Serial.printf("MQTT connected with %s\r\n", mqttName); }
+        }
+        else
+        {
+            IF_DEBUG { Serial.println( "MQTT did not connect"); }
+        }
+    }
+}
+
+void loop() {
+    uint32_t now = millis();
+    static uint32_t lastSampleTime = 0;
+    static uint32_t lastPublishTime = 0;
+    int newLightValue;
+    int lightChange;
+    float temperatureChange;
+    float dhtTemperature;
+    float dhtHumidity;
+    int result = 0;
+    char topicStr [30]; // "<nodeName>/xxXXxxXXxxXX" + null
+    char payloadStr [10]; // "100.00" + null
+    char info[64]; // "xxXXxxXXxxXX 100.00" + null
+
+#ifdef mqttPublishing
+    if (mqttClient.isConnected())
+    {
+        mqttClient.loop();
+    }
+#endif
+
+    if ( now - lastSampleTime >= sampleTime)
+    {
+        lastSampleTime = now;
+#ifdef mqttPublishing
+        if (!mqttClient.isConnected())
+        {
+            mqttClient.connect(nodeName);
+            IF_MQTTPUB { Serial.println( "attempting another connection"); }
+        }
+#endif
+
+        newLightValue = analogRead( pinLightSensor);
+        lightChange = lightValue - newLightValue;
+        if (abs(lightChange) > lightReportThreshhold)
+        {
+            // report change in light level without delay
+            IF_DEBUG { Serial.printf( "Light changed: %0d (last %d)\r\n",
+                    newLightValue, lightValue); }
+            snprintf(payloadStr, sizeof(payloadStr), "%d", newLightValue);
+            result = snprintf( topicStr, sizeof(topicStr), "%s/%s",
+                    nodeName, "light" );
+            if (result > sizeof( topicStr))
+            {
+                IF_DEBUG { Serial.println( "light demand topicString overflowed"); }
+            }
+            else
+            {
+                snprintf(payloadStr, sizeof(payloadStr), "%d", newLightValue);
+                IF_MQTTPUB mqttClient.publish( topicStr, payloadStr);
+            }
+            IF_PARTPUB Particle.publish("light", payloadStr, PRIVATE);
+        }
+        lightValue = newLightValue;
+
+        IF_DEBUG { Serial.println( "checking temperature sensors"); }
+        for (int i = 0; i < nSENSORS; i++)
+        {
+            float temp = getTemp(sensorAddresses[i]);
+            if (!isnan(temp))
+            {
+                celsius[i] = temp;
+                temperatureChange = temperatureAverage[ i] - temp;
+                if ( abs( temperatureChange) > temperatureReportThreshhold)
+                {
+                    IF_DEBUG { Serial.printf( "Temperature %d changed: %s %0.2f°C (ave %0.2f)\r\n",
+                            i, sensorString[i], temp, temperatureAverage[ i] );}
+                    result = snprintf( info, sizeof(info), "%s: %0.1f",
+                            sensorString[i], celsius[i] );
+                    IF_DEBUG { if (result > sizeof(info)) {
+                        Serial.println( "info  overflowed"); }}
+                    result = snprintf( topicStr, sizeof(topicStr), "%s/%s",
+                            nodeName, sensorString[ i] );
+                    IF_DEBUG { if (result > sizeof( topicStr)) {
+                        Serial.println( "topicStr overflowed"); }}
+                    result = snprintf( payloadStr, sizeof(payloadStr), "%0.2f",
+                            celsius[i]);
+                    IF_DEBUG { if (result > sizeof(payloadStr)) {
+                        Serial.println( "payloadStr overflowed"); }}
+                    IF_PARTPUB { mqttClient.publish( info, payloadStr); }
+                    IF_MQTTPUB { mqttClient.publish( topicStr, payloadStr); }
+                }
+
+                temperatureAverage[ i] =
+                        ((temperatureAverage[ i] * (float)(numberInTemperatureAverage -1)) +
+                        temp) / (float) numberInTemperatureAverage;
+                    lastValidTime[i] = now;
+                IF_DEBUG { Serial.printf("sensor %d: %s Temperature %0.2f\r\n",
+                        i, sensorString [i], temp); }
+            }
+        }
+
+        // read DHT while we're at it
+        dhtHumidity = dht.getHumidity();
+        // Read temperature as Celsius
+        dhtTemperature = dht.getTempCelcius();
+        if (isnan(dhtTemperature) || isnan(dhtHumidity))
+        {
+            IF_DEBUG { Serial.println("Failed to read from DHT sensor!"); }
+        }
+        else
+        {
+            IF_DEBUG { Serial.printf ("Temp: %0.1f°C Humid: %0.0f%%\r\n", dhtTemperature, dhtHumidity); }
+        }
+    }
+
+    if ( now - lastPublishTime >= publishTime && publishGroup == 0)
+    {
+        publishGroup = 1;
+
+        IF_DEBUG { Serial.println("Publishing now."); }
+        for (int i=0; i<nSENSORS; i++)
+        {
+            if (!isnan(celsius[i]) && (now - lastValidTime[i] <= freshTempTime))
+            {
+                result = snprintf( info, sizeof(info), "%s: %0.1f",
+                        sensorString[i], celsius[i] );
+                IF_DEBUG { if (result > sizeof(info)) {
+                    Serial.println( "info  overflowed"); }}
+                result = snprintf( topicStr, sizeof(topicStr), "%s/%s",
+                        nodeName, sensorString[i] );
+                IF_DEBUG { if (result > sizeof(topicStr)) {
+                    Serial.println( "dsTmp topicString overflowed"); }}
+                result = snprintf( payloadStr, sizeof(payloadStr), "%0.1f",
+                        celsius[i]);
+                IF_DEBUG { if (result > sizeof(payloadStr)) {
+                    Serial.println( "dsTmp payloadString overflowed"); }}
+                IF_MQTTPUB { mqttClient.publish( topicStr, payloadStr); }
+                IF_PARTPUB { Particle.publish( "dsTmp", info, PRIVATE); }
+            }
+        }
+    }
+
+    if ( now - lastPublishTime >= publishTime + 2000 && publishGroup == 1)
+    {
+        publishGroup = 0;
+        lastPublishTime = now;
+
+        result = snprintf(topicStr, sizeof(topicStr), "%s/%s", nodeName, "light");
+        IF_DEBUG { if (result > sizeof(topicStr)) {
+            Serial.println( "light topicString overflowed"); }}
+        result = snprintf(payloadStr, sizeof(payloadStr), "%d", lightValue);
+        IF_DEBUG { if (result > sizeof(payloadStr)) {
+            Serial.println( "light payloadString overflowed"); }}
+        IF_MQTTPUB { mqttClient.publish( topicStr, payloadStr); }
+        IF_PARTPUB { Particle.publish("light", payloadStr, PRIVATE); }
+
+        result = snprintf(topicStr, sizeof(topicStr), "%s/%s", nodeName, "temp");
+        IF_DEBUG { if (result > sizeof(topicStr)) {
+            Serial.println( "dhtTemp topicString overflowed"); }}
+        result = snprintf(payloadStr, sizeof(payloadStr), "%0.1f", dhtTemperature);
+        IF_DEBUG { if (result > sizeof(payloadStr)) {
+            Serial.println( "dhtTemp payloadString overflowed"); }}
+        IF_MQTTPUB { mqttClient.publish( topicStr, payloadStr); }
+        IF_PARTPUB { Particle.publish("dhtTemp", payloadStr, PRIVATE); }
+
+        result = snprintf(topicStr, sizeof(topicStr), "%s/%s", nodeName, "humid");
+        IF_DEBUG { if (result > sizeof(topicStr)) {
+            Serial.println( "dhtHumid topicString overflowed"); }}
+        result = snprintf(payloadStr, sizeof(payloadStr), "%0.0f", dhtHumidity);
+        IF_DEBUG { if (result > sizeof(payloadStr)) {
+            Serial.println( "dhtHumid payloadString overflowed"); }}
+        IF_MQTTPUB { mqttClient.publish( topicStr, payloadStr); }
+        IF_PARTPUB { Particle.publish("dhtHumid", payloadStr, PRIVATE); }
+    }
+}
+
+
+double getTemp(uint8_t addr[8]) {
+    double _temp;
+    int i = 0;
+
+    do {
+        _temp = ds18b20.getTemperature(addr);
+    } while (!ds18b20.crcCheck() && MAXRETRY > i++);
+
+    if (i < MAXRETRY) {
+        //_temp = ds18b20.convertToFahrenheit(_temp);
+        IF_DEBUG { Serial.println(_temp); }
+    }
+    else
+    {
+        _temp = NAN;
+        IF_DEBUG { Serial.println("Invalid reading"); }
+    }
+
+    return _temp;
+}
+
+void sensorToString (char *string, int sizeOfString, uint8_t addr[8])
+{
+    int result;
+    result = snprintf(string, sizeOfString, "%02X%02X%02X%02X%02X%02X%02X%02X",
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
+    if (result > sizeOfString)
+    {
+        IF_DEBUG { Serial.println("sensorToString overflowed"); }
+    }
+}
